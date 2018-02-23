@@ -1,10 +1,12 @@
 package main
 
+//package main
 import (
-	"fmt"
 	"database/sql"
-	_ "github.com/mattn/go-adodb"
+	"fmt"
 	"os"
+
+	_ "github.com/thr27/go-adodb"
 )
 
 func main() {

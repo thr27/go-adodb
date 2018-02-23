@@ -3,9 +3,13 @@ package adodb
 import (
 	"database/sql"
 	"database/sql/driver"
+	"fmt"
 	"io"
 	"math"
 	"math/big"
+	"reflect"
+	"strconv"
+	"strings"
 	"time"
 	"unsafe"
 
@@ -100,6 +104,8 @@ func (c *AdodbConn) begin(ctx context.Context) (driver.Tx, error) {
 }
 
 func (d *AdodbDriver) Open(dsn string) (driver.Conn, error) {
+	ole.CoInitialize(0)
+
 	unknown, err := oleutil.CreateObject("ADODB.Connection")
 	if err != nil {
 		return nil, err
@@ -125,6 +131,7 @@ func (c *AdodbConn) Close() error {
 	rv.Clear()
 	c.db.Release()
 	c.db = nil
+	ole.CoUninitialize()
 	return nil
 }
 
@@ -133,6 +140,7 @@ type AdodbStmt struct {
 	s  *ole.IDispatch
 	ps *ole.IDispatch
 	b  []string
+	q  *string
 }
 
 func (c *AdodbConn) Prepare(query string) (driver.Stmt, error) {
@@ -173,7 +181,7 @@ func (c *AdodbConn) prepare(ctx context.Context, query string) (driver.Stmt, err
 		return nil, err
 	}
 	defer val.Clear()
-	return &AdodbStmt{c, s, val.ToIDispatch(), nil}, nil
+	return &AdodbStmt{c, s, val.ToIDispatch(), nil, &query}, nil
 }
 
 func (s *AdodbStmt) Bind(bind []string) error {
@@ -209,22 +217,68 @@ func (s *AdodbStmt) NumInput() int {
 		return -1
 	}
 	defer rv.Clear()
-	return int(rv.Val)
+	n := int(rv.Val)
+	/* if provider does not count, e.g. vfpoledb */
+	if n == 0 && s.q != nil {
+		n = strings.Count(*s.q, "?")
+		s.b = make([]string, n)
+		for i := 0; i < n; i++ {
+			s.b[i] = strconv.Itoa(i)
+		}
+	}
+	return n
 }
 
 func (s *AdodbStmt) bind(args []namedValue) error {
-	if s.b != nil {
+	if (s.b != nil) || (s.q != nil) {
 		for i, v := range args {
 			var b string = "?"
 			if len(s.b) < i {
 				b = s.b[i]
 			}
-			unknown, err := oleutil.CallMethod(s.s, "CreateParameter", b, 12, 1)
-			if err != nil {
-				return err
+			/*
+				unknown, err := oleutil.CallMethod(s.s, "CreateParameter", b, 12, 1)
+				if err != nil {
+					return err
+				}
+			*/
+			var unknown *ole.VARIANT
+			var err error
+
+			switch vv := v.Value.(type) {
+			case string:
+				ss := vv
+				bs := ole.SysAllocStringLen(ss)
+				ln := len(ss)
+
+				unknown, err = oleutil.CallMethod(s.s, "CreateParameter", b, 8, 1, ln, bs)
+				if err != nil {
+					return err
+				}
+			case int64:
+				unknown, err = oleutil.CallMethod(s.s, "CreateParameter", b, 3, 1)
+				if err != nil {
+					return err
+				}
+
+			case bool:
+				unknown, err = oleutil.CallMethod(s.s, "CreateParameter", b, 11, 1)
+				if err != nil {
+					return err
+				}
+			case byte:
+				unknown, err = oleutil.CallMethod(s.s, "CreateParameter", b, 16, 1)
+				if err != nil {
+					return err
+				}
+
+			default:
+				panic(fmt.Sprintf("%v (%T) can't be handled by godrv", vv, vv))
+
 			}
+			/* --- */
 			param := unknown.ToIDispatch()
-			unknown.Clear()
+			//unknown.Clear()
 			rv, err := oleutil.PutProperty(param, "Value", v.Value)
 			if err != nil {
 				param.Release()
@@ -239,6 +293,7 @@ func (s *AdodbStmt) bind(args []namedValue) error {
 				return err
 			}
 			rv.Clear()
+			unknown.Clear()
 			param.Release()
 			param.Release()
 		}
@@ -535,4 +590,338 @@ func (rc *AdodbRows) Next(dest []driver.Value) error {
 	}
 	rv.Clear()
 	return nil
+}
+
+// ColumnTypeDatabaseTypeName implement RowsColumnTypeDatabaseTypeName.
+func (rc *AdodbRows) ColumnTypeDatabaseTypeName(i int) string {
+	if i >= rc.nc {
+		return ""
+	}
+	unknown, err := oleutil.GetProperty(rc.rc, "Fields")
+	if err != nil {
+		return ""
+	}
+	fields := unknown.ToIDispatch()
+	unknown.Clear()
+	defer fields.Release()
+
+	var varval ole.VARIANT
+	varval.VT = ole.VT_I4
+	varval.Val = int64(i)
+	val, err := oleutil.CallMethod(fields, "Item", &varval)
+	if err != nil {
+		return ""
+	}
+	item := val.ToIDispatch()
+	val.Clear()
+	typ, err := oleutil.GetProperty(item, "Type")
+	if err != nil {
+		item.Release()
+		return ""
+	}
+	typname := ""
+	switch typ.Val {
+	case 0:
+		typname = "ADEMPTY"
+	case 2:
+		typname = "ADSMALLINT"
+	case 3:
+		typname = "ADINTEGER"
+	case 4:
+		typname = "ADSINGLE"
+	case 5:
+		typname = "ADDOUBLE"
+	case 6:
+		typname = "ADCURRENCY"
+	case 7:
+		typname = "ADDATE"
+	case 8:
+		typname = "ADBSTR"
+	case 9:
+		typname = "ADIDISPATCH"
+	case 10:
+		typname = "ADERROR"
+	case 11:
+		typname = "ADBOOLEAN"
+	case 12:
+		typname = "ADVARIANT"
+	case 13:
+		typname = "ADIUNKNOWN"
+	case 14:
+		typname = "ADDECIMAL"
+	case 16:
+		typname = "ADTINYINT"
+	case 17:
+		typname = "ADUNSIGNEDTINYINT"
+	case 18:
+		typname = "ADUNSIGNEDSMALLINT"
+	case 19:
+		typname = "ADUNSIGNEDINT"
+	case 20:
+		typname = "ADBIGINT"
+	case 21:
+		typname = "ADUNSIGNEDBIGINT"
+	case 72:
+		typname = "ADGUID"
+	case 128:
+		typname = "ADBINARY"
+	case 129:
+		typname = "ADCHAR"
+	case 130:
+		typname = "ADWCHAR"
+	case 131:
+		typname = "ADNUMERIC"
+	case 132:
+		typname = "ADUSERDEFINED"
+	case 133:
+		typname = "ADDBDATE"
+	case 134:
+		typname = "ADDBTIME"
+	case 135:
+		typname = "ADDBTIMESTAMP"
+	case 136:
+		typname = "ADCHAPTER"
+	case 200:
+		typname = "ADVARCHAR"
+	case 201:
+		typname = "ADLONGVARCHAR"
+	case 202:
+		typname = "ADVARWCHAR"
+	case 203:
+		typname = "ADLONGVARWCHAR"
+	case 204:
+		typname = "ADVARBINARY"
+	case 205:
+		typname = "ADLONGVARBINARY"
+	}
+	typ.Clear()
+	item.Release()
+	return typname
+}
+
+func (rc *AdodbRows) ColumnTypeLength(i int) (length int64, ok bool) {
+	if i >= rc.nc {
+		return 0, false
+	}
+	unknown, err := oleutil.GetProperty(rc.rc, "Fields")
+	if err != nil {
+		return 0, false
+	}
+	fields := unknown.ToIDispatch()
+	unknown.Clear()
+	defer fields.Release()
+
+	var varval ole.VARIANT
+	varval.VT = ole.VT_I4
+	varval.Val = int64(i)
+	val, err := oleutil.CallMethod(fields, "Item", &varval)
+	if err != nil {
+		return 0, false
+	}
+	item := val.ToIDispatch()
+	val.Clear()
+	siz, err := oleutil.GetProperty(item, "DefinedSize")
+	if err != nil {
+		item.Release()
+		return 0, false
+	}
+	sizval := siz.Val
+	siz.Clear()
+	item.Release()
+	return int64(sizval), true
+}
+
+// ColumnTypeNullable implement RowsColumnTypeNullable.
+func (rc *AdodbRows) ColumnTypeNullable(i int) (nullable, ok bool) {
+	if i >= rc.nc {
+		return false, false
+	}
+	unknown, err := oleutil.GetProperty(rc.rc, "Fields")
+	if err != nil {
+		return false, false
+	}
+	fields := unknown.ToIDispatch()
+	unknown.Clear()
+	defer fields.Release()
+
+	var varval ole.VARIANT
+	varval.VT = ole.VT_I4
+	varval.Val = int64(i)
+	val, err := oleutil.CallMethod(fields, "Item", &varval)
+	if err != nil {
+		return false, false
+	}
+	item := val.ToIDispatch()
+	val.Clear()
+	att, err := oleutil.GetProperty(item, "Attributes")
+	if err != nil {
+		item.Release()
+		return false, false
+	}
+	attributes := att.Val
+	att.Clear()
+	item.Release()
+	return attributes&0x20 != 0, true
+}
+
+// ColumnTypeScanType implement RowsColumnTypeScanType.
+func (rc *AdodbRows) ColumnTypeScanType(i int) reflect.Type {
+	if i >= rc.nc {
+		return reflect.TypeOf(nil)
+	}
+	unknown, err := oleutil.GetProperty(rc.rc, "Fields")
+	if err != nil {
+		return reflect.TypeOf(nil)
+	}
+	fields := unknown.ToIDispatch()
+	unknown.Clear()
+	defer fields.Release()
+
+	var varval ole.VARIANT
+	varval.VT = ole.VT_I4
+	varval.Val = int64(i)
+	val, err := oleutil.CallMethod(fields, "Item", &varval)
+	if err != nil {
+		return reflect.TypeOf(nil)
+	}
+	item := val.ToIDispatch()
+	val.Clear()
+	typ, err := oleutil.GetProperty(item, "Type")
+	if err != nil {
+		item.Release()
+		return reflect.TypeOf(nil)
+	}
+	var rt reflect.Type
+	switch typ.Val {
+	case 0: // ADEMPTY
+		rt = reflect.TypeOf(nil)
+	case 2: // ADSMALLINT
+		rt = reflect.TypeOf(int16(0))
+	case 3: // ADINTEGER
+		rt = reflect.TypeOf(int32(0))
+	case 4: // ADSINGLE
+		rt = reflect.TypeOf(float32(0))
+	case 5: // ADDOUBLE
+		rt = reflect.TypeOf(float64(0))
+	case 6: // ADCURRENCY
+		rt = reflect.TypeOf(float64(0))
+	case 7: // ADDATE
+		rt = reflect.TypeOf(time.Time{})
+	case 8: // ADBSTR
+		rt = reflect.TypeOf("")
+	case 9: // ADIDISPATCH
+		rt = reflect.TypeOf((*ole.IDispatch)(nil))
+	case 10: // ADERROR
+		rt = reflect.TypeOf((error)(nil))
+	case 11: // ADBOOLEAN
+		rt = reflect.TypeOf(true)
+	case 12: // ADVARIANT
+		var va ole.VARIANT
+		rt = reflect.TypeOf(va)
+	case 13: // ADIUNKNOWN
+		rt = reflect.TypeOf((*ole.IUnknown)(nil))
+	case 14: // ADDECIMAL
+		rt = reflect.TypeOf(float64(0))
+	case 16: // ADTINYINT
+		rt = reflect.TypeOf(int8(0))
+	case 17: // ADUNSIGNEDTINYINT
+		rt = reflect.TypeOf(uint8(0))
+	case 18: // ADUNSIGNEDSMALLINT
+		rt = reflect.TypeOf(uint16(0))
+	case 19: // ADUNSIGNEDINT
+		rt = reflect.TypeOf(uint32(0))
+	case 20: // ADBIGINT
+		rt = reflect.TypeOf((*big.Int)(nil))
+	case 21: // ADUNSIGNEDBIGINT
+		rt = reflect.TypeOf(nil)
+	case 72: // ADGUID
+		var gi ole.GUID
+		rt = reflect.TypeOf(gi)
+	case 128: // ADBINARY
+		rt = reflect.TypeOf((*ole.SafeArray)(nil))
+	case 129: // ADCHAR
+		rt = reflect.TypeOf(byte(0))
+	case 130: // ADWCHAR
+		rt = reflect.TypeOf(rune(0))
+	case 131: // ADNUMERIC
+		rt = reflect.TypeOf(float64(0))
+	case 132: // ADUSERDEFINED
+		rt = reflect.TypeOf(uintptr(0))
+	case 133: // ADDBDATE
+		rt = reflect.TypeOf(time.Time{})
+	case 134: // ADDBTIME
+		rt = reflect.TypeOf(time.Time{})
+	case 135: // ADDBTIMESTAMP
+		rt = reflect.TypeOf(time.Time{})
+	case 136: // ADCHAPTER
+		rt = reflect.TypeOf("")
+	case 200: // ADVARCHAR
+		rt = reflect.TypeOf("")
+	case 201: // ADLONGVARCHAR
+		rt = reflect.TypeOf("")
+	case 202: // ADVARWCHAR
+		rt = reflect.TypeOf("")
+	case 203: // ADLONGVARWCHAR
+		rt = reflect.TypeOf("")
+	case 204: // ADVARBINARY
+		rt = reflect.TypeOf([]byte{})
+	case 205: // ADLONGVARBINARY
+		rt = reflect.TypeOf((*ole.SafeArray)(nil))
+	}
+	typ.Clear()
+	item.Release()
+	return rt
+}
+
+func (rc *AdodbRows) ColumnTypePrecisionScale(i int) (precision, scale int64, ok bool) {
+	if i >= rc.nc {
+		return 0, 0, false
+	}
+	unknown, err := oleutil.GetProperty(rc.rc, "Fields")
+	if err != nil {
+		return 0, 0, false
+	}
+	fields := unknown.ToIDispatch()
+	unknown.Clear()
+	defer fields.Release()
+
+	var varval ole.VARIANT
+	varval.VT = ole.VT_I4
+	varval.Val = int64(i)
+	val, err := oleutil.CallMethod(fields, "Item", &varval)
+	if err != nil {
+		return 0, 0, false
+	}
+
+	item := val.ToIDispatch()
+	val.Clear()
+
+	typ, err := oleutil.GetProperty(item, "Type")
+	if err != nil {
+		item.Release()
+		return 0, 0, false
+	}
+	if typ.Val != 131 {
+		item.Release()
+		return 0, 0, true
+	}
+
+	prec, err := oleutil.GetProperty(item, "Precision")
+	if err != nil {
+		item.Release()
+		return 0, 0, false
+	}
+
+	scl, err := oleutil.GetProperty(item, "NumericScale")
+	if err != nil {
+		item.Release()
+		return 0, 0, false
+	}
+
+	precval := prec.Val
+	sclval := scl.Val
+	prec.Clear()
+	scl.Clear()
+	item.Release()
+	return int64(precval), int64(sclval), true
 }

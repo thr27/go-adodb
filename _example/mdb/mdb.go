@@ -1,5 +1,7 @@
 package main
 
+//package main
+
 import (
 	"database/sql"
 	"fmt"
@@ -8,7 +10,7 @@ import (
 
 	"github.com/go-ole/go-ole"
 	"github.com/go-ole/go-ole/oleutil"
-	_ "github.com/mattn/go-adodb"
+	_ "github.com/thr27/go-adodb"
 )
 
 func createMdb(f string) error {
