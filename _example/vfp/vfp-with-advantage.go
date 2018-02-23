@@ -52,5 +52,13 @@ func main() {
 
 	}
 	defer rows.Close()
+
+	args := make([]interface{}, 2, 2)
+	args[0] = "HALLO"
+	args[1] = "FTI4092222035955639"
+
+	s := fmt.Sprintf("UPDATE QUEUE set cupduser_ = ? WHERE csurrogat_ = ?")
+	_, err = db.Exec(s, args...)
+
 	defer db.Close()
 }

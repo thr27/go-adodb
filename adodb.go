@@ -204,22 +204,24 @@ func (s *AdodbStmt) Close() error {
 }
 
 func (s *AdodbStmt) NumInput() int {
+	var n = -1
 	if s.b != nil {
 		return len(s.b)
 	}
 	rv, err := oleutil.CallMethod(s.ps, "Refresh")
-	if err != nil {
-		return -1
+	if err == nil {
+		rv.Clear()
+		rv, err = oleutil.GetProperty(s.ps, "Count")
+		if err != nil {
+			n = -1
+		} else {
+			defer rv.Clear()
+			n = int(rv.Val)
+		}
 	}
-	rv.Clear()
-	rv, err = oleutil.GetProperty(s.ps, "Count")
-	if err != nil {
-		return -1
-	}
-	defer rv.Clear()
-	n := int(rv.Val)
-	/* if provider does not count, e.g. vfpoledb */
-	if n == 0 && s.q != nil {
+	/* if provider does can not count, e.g. vfpoledb,
+	but expects CreateParameter in args ... (aka. SetParameterInfo error) */
+	if n == -1 && s.q != nil {
 		n = strings.Count(*s.q, "?")
 		s.b = make([]string, n)
 		for i := 0; i < n; i++ {
@@ -232,7 +234,7 @@ func (s *AdodbStmt) NumInput() int {
 func (s *AdodbStmt) bind(args []namedValue) error {
 	if (s.b != nil) || (s.q != nil) {
 		for i, v := range args {
-			var b string = "?"
+			var b = "?"
 			if len(s.b) < i {
 				b = s.b[i]
 			}
